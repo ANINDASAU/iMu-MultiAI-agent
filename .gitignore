@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Virtual environments
+venv/
+.env
+.env.*
+myvenv/
+.venv/
+
+# VSCode and OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+/dist
+
+# Ignore environment files and local secrets
+/backend/.env
+frontend/.env
+
+# Logs
+*.log

@@ -18,6 +18,17 @@ try:
     if API_KEY:
         genai.configure(api_key=API_KEY)
         LLM_MODEL = os.getenv('GEN_MODEL', 'models/gemini-2.5-flash')
+        # detect package API shape and set a flag so we call it correctly later
+        if hasattr(genai, 'chat') and hasattr(genai.chat, 'create'):
+            GEN_API_STYLE = 'chat'
+        elif hasattr(genai, 'generate'):
+            GEN_API_STYLE = 'generate'
+        elif hasattr(genai, 'text') and hasattr(genai.text, 'generate'):
+            GEN_API_STYLE = 'text'
+        else:
+            GEN_API_STYLE = 'unknown'
+        # Minimum confidence (0.0 - 1.0) required to accept LLM classification; default 0.6
+        GEN_CONFIDENCE_THRESHOLD = float(os.getenv('GEN_CONFIDENCE_THRESHOLD', '0.6'))
         LLM_ENABLED = True
     else:
         LLM_ENABLED = False
@@ -27,7 +38,17 @@ except Exception:
     LLM_ENABLED = False
 
 SUPABASE = SupabaseClient()
-WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+
+# Map unit keys to their corresponding Relay.app webhook URLs
+WEBHOOK_URLS = {
+    'admission_scholarship': os.getenv('WEBHOOK_URL_ADMISSION_SCHOLARSHIP'),
+    'academic_support': os.getenv('WEBHOOK_URL_ACADEMIC_SUPPORT'),
+    'student_welfare': os.getenv('WEBHOOK_URL_STUDENT_WELFARE'),
+    'career_skill_development': os.getenv('WEBHOOK_URL_CAREER_SKILL_DEVELOPMENT')
+}
+
+# Fallback to legacy single WEBHOOK_URL if unit-specific ones are not set (for backward compatibility)
+WEBHOOK_URL_LEGACY = os.getenv('WEBHOOK_URL')
 
 # Greeting detection to avoid treating short greets as a query
 GREETINGS = {"hi", "hello", "hey", "hii", "hiii", "good morning", "good afternoon", "good evening"}
@@ -79,6 +100,7 @@ class ConversationState:
         self.student_query: str | None = None
         self.routed_unit: str | None = None
         self.tone: str | None = None  # 'urgent' | 'normal' inferred by LLM
+        self.llm_confidence: float | None = None
         self.last_bot_message: str | None = None
         self.created_at = datetime.utcnow()
         self.submitted: bool = False  # prevents duplicate webhook triggers
@@ -93,6 +115,7 @@ class ConversationState:
             'student_query': self.student_query,
             'routed_unit': self.routed_unit,
             'tone': self.tone,
+            'confidence': self.llm_confidence,
             'timestamp': self.created_at.isoformat()
         }
 
@@ -159,8 +182,33 @@ class ConversationManager:
 
         # If we reach here, all fields are present or were set from the message; ensure routed_unit is set from the query
         if not state.routed_unit:
-            state.routed_unit = self.router_node(state.student_query or message)
-            print(f"[workflow] Routed session {state.session_id} to unit: {state.routed_unit}")
+            # Prefer LLM classification (if available) but only accept if confidence >= threshold (if provided)
+            if LLM_ENABLED:
+                try:
+                    llm_result = self.llm_classify(state.student_query or message)
+                    if llm_result:
+                        unit, tone, confidence = llm_result
+                        accepted = False
+                        # If confidence is provided, compare to threshold; otherwise accept LLM result
+                        try:
+                            threshold = float(os.getenv('GEN_CONFIDENCE_THRESHOLD', '0.6'))
+                        except Exception:
+                            threshold = 0.6
+                        if confidence is None or confidence >= threshold:
+                            # normalize unit and accept only known target keys
+                            if unit in ['admission_scholarship','academic_support','student_welfare','career_skill_development']:
+                                state.routed_unit = unit
+                                state.tone = tone or state.tone or 'normal'
+                                state.llm_confidence = confidence
+                                accepted = True
+                                print(f"[workflow] LLM routed session {state.session_id} to unit: {state.routed_unit} with tone: {state.tone} (conf={confidence})")
+                except Exception as e:
+                    print(f"[workflow] LLM routing failed: {e}")
+            # Fallback to rule-based routing if LLM was not used or not confident enough
+            if not state.routed_unit:
+                state.routed_unit = self.router_node(state.student_query or message)
+                state.tone = state.tone or 'normal'
+                print(f"[workflow] Routed session {state.session_id} to unit: {state.routed_unit}")
 
         # If all required collected, store and trigger webhook
         if state.is_complete():
@@ -203,17 +251,35 @@ class ConversationManager:
                 "Respond only with a single-line JSON object with keys 'unit' and 'tone', e.g. {\"unit\": \"academic_support\", \"tone\": \"normal\"}."
             )
             user_prompt = f"Student query: {message}"
-            resp = genai.chat.create(model=LLM_MODEL, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
-
-            # Robustly extract text from the response
+            # Call genai using supported API style
             text = ''
             try:
-                # preferred: resp.last.content or resp.candidates
+                if 'GEN_API_STYLE' in globals() and GEN_API_STYLE == 'chat' and hasattr(genai, 'chat'):
+                    resp = genai.chat.create(model=LLM_MODEL, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], temperature=0.0)
+                elif 'GEN_API_STYLE' in globals() and GEN_API_STYLE == 'generate' and hasattr(genai, 'generate'):
+                    prompt = system_prompt + "\n\n" + user_prompt
+                    resp = genai.generate(model=LLM_MODEL, input=prompt, temperature=0.0)
+                elif 'GEN_API_STYLE' in globals() and GEN_API_STYLE == 'text' and hasattr(genai, 'text'):
+                    resp = genai.text.generate(model=LLM_MODEL, prompt=system_prompt + "\n\n" + user_prompt, temperature=0.0)
+                else:
+                    # best-effort: try common call names and fall back to str(resp)
+                    try:
+                        resp = genai.chat.create(model=LLM_MODEL, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], temperature=0.0)
+                    except Exception:
+                        try:
+                            resp = genai.generate(model=LLM_MODEL, input=system_prompt + "\n\n" + user_prompt, temperature=0.0)
+                        except Exception:
+                            resp = genai.text.generate(model=LLM_MODEL, prompt=system_prompt + "\n\n" + user_prompt, temperature=0.0)
+
+                # Robustly extract text from the response - try common shapes
                 if hasattr(resp, 'last') and resp.last and hasattr(resp.last, 'content'):
-                    text = resp.last.content[0].get('text', '') if isinstance(resp.last.content, list) else str(resp.last.content)
+                    content = resp.last.content
+                    if isinstance(content, list) and content:
+                        text = content[0].get('text', '')
+                    else:
+                        text = str(content)
                 elif hasattr(resp, 'candidates') and resp.candidates:
                     cand = resp.candidates[0]
-                    # candidate may be a dict with content
                     if isinstance(cand, dict) and 'content' in cand:
                         content = cand['content']
                         if isinstance(content, list) and content:
@@ -222,10 +288,13 @@ class ConversationManager:
                             text = str(content)
                     else:
                         text = str(cand)
+                elif hasattr(resp, 'text'):
+                    text = getattr(resp, 'text')
                 else:
                     text = str(resp)
-            except Exception:
-                text = str(resp)
+            except Exception as e:
+                print(f"[workflow] genai call failed: {e}")
+                text = ''
 
             # extract JSON object from the model output
             import re, json
@@ -235,14 +304,20 @@ class ConversationManager:
                 parsed = json.loads(obj_text)
                 unit = parsed.get('unit')
                 tone = parsed.get('tone', 'normal')
-                return unit, tone
+                confidence = parsed.get('confidence')
+                # coerce confidence to float if possible
+                try:
+                    confidence = float(confidence) if confidence is not None else None
+                except Exception:
+                    confidence = None
+                return unit, tone, confidence
 
-            # Fallback: simple keyword extraction from model text
-            t_low = text.lower()
+            # Fallback: simple keyword extraction from model text or original message
+            t_low = text.lower() if text else ''
             for kw, unit in UNIT_MAP.items():
-                if kw in t_low:
-                    tone = 'urgent' if any(w in t_low for w in ['urgent', 'emergency', 'immediately', 'asap']) else 'normal'
-                    return unit, tone
+                if kw in t_low or kw in message.lower():
+                    tone = 'urgent' if any(w in t_low or w in message.lower() for w in ['urgent', 'emergency', 'immediately', 'asap']) else 'normal'
+                    return unit, tone, None
         except Exception as e:
             print(f"[workflow] Error during LLM classify: {e}")
         return None
@@ -283,25 +358,29 @@ class ConversationManager:
             'student_query': clean_query,
             'routed_unit': state.routed_unit,
             'tone': state.tone,
+            'confidence': state.llm_confidence,
             'timestamp': state.created_at.isoformat()
         }
         await SUPABASE.insert_record('student_queries', record)
 
-        # Send webhook
-        if WEBHOOK_URL:
+        # Send webhook to the correct unit-specific webhook URL
+        webhook_url = WEBHOOK_URLS.get(state.routed_unit) or WEBHOOK_URL_LEGACY
+        if webhook_url:
             payload = {
                 "Student Name": state.student_name,
                 "Academic Year": state.academic_year,
                 "Student Query": clean_query,
                 "unit": state.routed_unit,
-                "tone": state.tone
+                "tone": state.tone,
+                "confidence": state.llm_confidence
             }
             async with httpx.AsyncClient() as client:
                 try:
-                    await client.post(WEBHOOK_URL, json=payload, timeout=10.0)
-                except Exception:
+                    await client.post(webhook_url, json=payload, timeout=10.0)
+                    print(f"[workflow] Webhook sent to {state.routed_unit} unit: {webhook_url}")
+                except Exception as e:
                     # Do not crash; log in real app
-                    pass
+                    print(f"[workflow] Webhook POST failed for {state.routed_unit}: {e}")
 
     def user_friendly_unit_name(self, unit_key: str) -> str:
         mapping = {

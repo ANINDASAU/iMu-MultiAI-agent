@@ -9,3 +9,11 @@ create table if not exists public.student_queries (
 );
 
 create index if not exists idx_student_queries_timestamp on public.student_queries (timestamp);
+
+-- Add new columns used by the backend (tone and confidence)
+-- Run these statements in Supabase SQL editor to update the schema without losing data
+ALTER TABLE public.student_queries
+  ADD COLUMN IF NOT EXISTS tone text;
+
+ALTER TABLE public.student_queries
+  ADD COLUMN IF NOT EXISTS confidence double precision;

@@ -35,5 +35,20 @@ class SupabaseClient:
             print(f"[supabase] Inserted record into {table}: {record}")
             return result
         except Exception as e:
+            # If the error indicates a missing column (e.g., 'confidence'), try dropping it and retrying once
+            err_str = str(e).lower()
             print(f"[supabase] Insert failed: {e}")
+            if 'could not find' in err_str or 'column' in err_str:
+                # Attempt to remove unknown keys commonly added (like 'confidence') and retry
+                rec2 = record.copy()
+                if 'confidence' in rec2:
+                    rec2.pop('confidence', None)
+                    def _insert_retry():
+                        return self.client.table(table).insert(rec2).execute()
+                    try:
+                        result = await loop.run_in_executor(None, _insert_retry)
+                        print(f"[supabase] Inserted record into {table} after dropping confidence: {rec2}")
+                        return result
+                    except Exception as e2:
+                        print(f"[supabase] Insert retry failed: {e2}")
             return None
