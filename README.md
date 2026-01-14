@@ -90,7 +90,7 @@ VS_UniversityAgent/
 │
 ├── .gitignore                         # Ignore .env, node_modules, __pycache__
 ├── README.md                          # This file
-└── anindamy_langgraph.py             # Reference: Colab implementation (LLM patterns)
+
 ```
 
 ---
